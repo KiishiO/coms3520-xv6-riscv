@@ -17,6 +17,7 @@
 
 volatile int panicking = 0; // printing a panic message
 volatile int panicked = 0;  // spinning forever at end of a panic
+volatile int logging_enabled = 1;
 
 // lock to avoid interleaving concurrent printk's.
 static struct {
@@ -66,6 +67,9 @@ printk(char *fmt, ...)
   va_list ap;
   int i, cx, c0, c1, c2;
   char *s;
+
+  if (!logging_enabled)
+    return 0;
 
   if (panicking == 0)
     acquire(&pr.lock);

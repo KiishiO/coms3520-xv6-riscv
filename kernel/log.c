@@ -6,6 +6,7 @@
 #include "sleeplock.h"
 #include "fs.h"
 #include "buf.h"
+#include "proc.h"
 
 // Simple logging that allows concurrent FS system calls.
 //
@@ -48,8 +49,66 @@ struct log {
 };
 struct log log;
 
+extern volatile int logging_enabled;
+extern struct proc proc[NPROC];
+
 static void recover_from_log(void);
 static void commit();
+
+void
+startLogging(void)
+{
+  struct proc *p = myproc();
+
+  logging_enabled = 1;
+  printk("Logging Started\n");
+
+  acquire(&schedsel_lock);
+  acquire(&p->lock);
+  p->sched_trace_owner = p->pid;
+  release(&p->lock);
+  release(&schedsel_lock);
+}
+
+void
+stopLogging(void)
+{
+  struct proc *current = myproc();
+  struct proc *p;
+  int owner;
+
+  acquire(&current->lock);
+  owner = current->sched_trace_owner;
+  if (owner == 0)
+    owner = current->pid;
+  release(&current->lock);
+
+  acquire(&schedsel_lock);
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->sched_trace_owner == owner)
+      p->sched_trace_owner = 0;
+    release(&p->lock);
+  }
+  release(&schedsel_lock);
+
+  printk("Logging Stopped\n");
+  logging_enabled = 0;
+}
+
+uint64
+sys_startLogging(void)
+{
+  startLogging();
+  return 0;
+}
+
+uint64
+sys_stopLogging(void)
+{
+  stopLogging();
+  return 0;
+}
 
 void
 initlog(int dev, struct superblock *sb)

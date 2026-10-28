@@ -27,6 +27,7 @@ struct cpu {
 };
 
 extern struct cpu cpus[NCPU];
+extern struct spinlock schedsel_lock;
 
 // per-process data for the trap handling code in trampoline.S.
 // sits in a page by itself just under the trampoline page in the
@@ -88,6 +89,8 @@ struct proc {
   int killed;           // If non-zero, have been killed
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
+  int nice;             // Process nice value, range [-20, 19]
+  int sched_trace_owner; // PID that enabled scheduler tracing, or 0
 
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process

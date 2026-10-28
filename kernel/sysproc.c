@@ -7,6 +7,9 @@
 #include "proc.h"
 #include "vm.h"
 
+extern struct proc proc[NPROC];
+extern volatile int logging_enabled;
+
 uint64
 sys_exit(void)
 {
@@ -62,6 +65,45 @@ sys_sbrk(void)
     myproc()->sz += n;
   }
   return addr;
+}
+
+uint64
+sys_nice(void)
+{
+  int pid;
+  int inc;
+  int new_nice;
+  int result = 0;
+  int found = 0;
+  struct proc *p;
+
+  argint(0, &pid);
+  argint(1, &inc);
+
+  acquire(&schedsel_lock);
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED && p->pid == pid) {
+      long long adjusted = (long long)p->nice + inc;
+      new_nice = adjusted;
+      if (new_nice < -20)
+        new_nice = -20;
+      else if (new_nice > 19)
+        new_nice = 19;
+
+      p->nice = new_nice;
+      result = p->nice;
+      found = 1;
+      release(&p->lock);
+      break;
+    }
+    release(&p->lock);
+  }
+  release(&schedsel_lock);
+
+  if (found && logging_enabled)
+    printk("nice set to %d for %d\n", result, pid);
+  return result;
 }
 
 uint64

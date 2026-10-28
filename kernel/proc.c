@@ -14,8 +14,13 @@ struct proc *initproc;
 
 int nextpid = 1;
 struct spinlock pid_lock;
+struct spinlock schedsel_lock;
+static int sched_cursor;
+static int last_trace_pid;
+static uint last_trace_ticks;
 
 extern void forkret(void);
+extern volatile int logging_enabled;
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
@@ -51,6 +56,8 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&schedsel_lock, "schedsel");
+  sched_cursor = 0;
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -123,6 +130,8 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->nice = 0;
+  p->sched_trace_owner = 0;
   p->state = USED;
 
   // Allocate a trapframe page.
@@ -163,6 +172,8 @@ freeproc(struct proc *p)
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->nice = 0;
+  p->sched_trace_owner = 0;
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
@@ -225,8 +236,11 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  release(&p->lock);
+  acquire(&schedsel_lock);
+  acquire(&p->lock);
   p->state = RUNNABLE;
-
+  release(&schedsel_lock);
   release(&p->lock);
 }
 
@@ -281,6 +295,10 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  acquire(&p->lock);
+  np->sched_trace_owner = p->sched_trace_owner;
+  release(&p->lock);
+
   // increment reference counts on open file descriptors.
   for (i = 0; i < NOFILE; i++)
     if (p->ofile[i])
@@ -297,8 +315,10 @@ kfork(void)
   np->parent = p;
   release(&wait_lock);
 
+  acquire(&schedsel_lock);
   acquire(&np->lock);
   np->state = RUNNABLE;
+  release(&schedsel_lock);
   release(&np->lock);
 
   return pid;
@@ -429,6 +449,7 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *best;
   struct cpu *c = mycpu();
 
   c->proc = 0;
@@ -441,31 +462,63 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
+    // Sample ticks before taking scheduler or process locks. clockintr()
+    // holds tickslock while waking processes.
+    uint dispatch_ticks;
+    acquire(&tickslock);
+    dispatch_ticks = ticks;
+    release(&tickslock);
+
+    acquire(&schedsel_lock);
+    best = 0;
+    int best_slot = 0;
+    int best_nice = 0;
+    for (int offset = 0; offset < NPROC; offset++) {
+      int slot = (sched_cursor + offset) % NPROC;
+      p = &proc[slot];
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+      if (p->state == RUNNABLE && (best == 0 || p->nice < best_nice)) {
+        best = p;
+        best_slot = slot;
+        best_nice = p->nice;
       }
       release(&p->lock);
     }
-    if (found == 0) {
+
+    if (best == 0) {
+      release(&schedsel_lock);
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
+      continue;
     }
+
+    acquire(&best->lock);
+    if (best->state != RUNNABLE || best->nice != best_nice) {
+      release(&best->lock);
+      release(&schedsel_lock);
+      continue;
+    }
+
+    // Keep the process lock across swtch; the process releases it after
+    // starting and reacquires it before switching back to the scheduler.
+    best->state = RUNNING;
+    c->proc = best;
+    sched_cursor = (best_slot + 1) % NPROC;
+    if (logging_enabled && best->sched_trace_owner != 0 &&
+        (best->pid != last_trace_pid || dispatch_ticks != last_trace_ticks)) {
+      printk("running pid %d at ticks %u\n", best->pid, dispatch_ticks);
+      last_trace_pid = best->pid;
+      last_trace_ticks = dispatch_ticks;
+    }
+    release(&schedsel_lock);
+    swtch(&c->context, &best->context);
+
+    // Don't re-enable interrupts on release.
+    mycpu()->intena = 0;
+
+    // The process changed its state before switching back.
+    c->proc = 0;
+    release(&best->lock);
   }
 }
 
@@ -501,8 +554,11 @@ void
 yield(void)
 {
   struct proc *p = myproc();
+
+  acquire(&schedsel_lock);
   acquire(&p->lock);
   p->state = RUNNABLE;
+  release(&schedsel_lock);
   sched();
   release(&p->lock);
 }
@@ -579,6 +635,7 @@ wakeup(void *chan)
   struct proc *p;
 
   for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&schedsel_lock);
     acquire(&p->lock);
     if (p->chan == chan) {
       // If the process is waiting for wakeups on this channel,
@@ -586,12 +643,13 @@ wakeup(void *chan)
       p->chan = 0;
 
       // If this waiting process has gotten so far as to actually
-      // go to sleep, also set it back to RUNNING.
+      // go to sleep, make it runnable again.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
       }
     }
     release(&p->lock);
+    release(&schedsel_lock);
   }
 }
 
@@ -604,6 +662,7 @@ kkill(int pid)
   struct proc *p;
 
   for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&schedsel_lock);
     acquire(&p->lock);
     if (p->pid == pid) {
       p->killed = 1;
@@ -612,9 +671,11 @@ kkill(int pid)
         p->state = RUNNABLE;
       }
       release(&p->lock);
+      release(&schedsel_lock);
       return 0;
     }
     release(&p->lock);
+    release(&schedsel_lock);
   }
   return -1;
 }

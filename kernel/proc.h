@@ -111,7 +111,9 @@ struct proc {
   int qticks; // ticks used in the current quantum
   int level;  // queue level, for multi-level policies
   int used;   // ticks used at the current level (allotment)
+  int start;  // nice-derived starting queue for MLFQ
   uint64 vrt; // weighted CPU usage, for fair-share policies
+  uint64 stride; // pass increment for stride scheduling
 
   // Project 1C: workload harness slot, or -1 if not a worker.
   // Owned by workload.c; do not modify.

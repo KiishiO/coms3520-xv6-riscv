@@ -8,6 +8,13 @@
 // Each policy has an ID. Select one at run time with the
 // set_scheduler(id) system call (for example: wl 2 1). To try a
 // different setting, such as another quantum, give it its own ID.
+// ID 3: three-level MLFQ with nice-based starting queues and boosts.
+// ID 5: MLFQ with weighted-stride selection within each level.
+// ID 10: MLFQ with a 30-tick boost interval.
+// ID 11: MLFQ with a 5-tick Q1 quantum.
+// ID 12: MLFQ with a 5-tick Q1 allotment.
+// ID 4: weighted stride scheduling with a 5-tick quantum.
+// ID 6: round robin with a 5-tick (50 ms) quantum.
 //
 // Rules for policy code (Section 2.2 of the project document):
 //  1. The system has one CPU. These functions run with interrupts off
@@ -38,6 +45,23 @@
 #define SCHED_RR     0 // round robin, 10-tick (100 ms) quantum: stock xv6
 #define SCHED_RR1    1 // round robin, 1-tick (10 ms) quantum
 #define SCHED_PRIO   2 // strict priority by nice (Project 1B), 10-tick quantum
+#define SCHED_MLFQ   3 // three-level MLFQ
+#define SCHED_STRIDE 4 // weighted stride scheduling, 5-tick quantum
+#define SCHED_MLFQ_STRIDE 5 // MLFQ with weighted-stride selection per level
+#define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
+#define SCHED_MLFQ_BOOST30 10
+#define SCHED_MLFQ_Q1Q5    11
+#define SCHED_MLFQ_Q1A5    12
+
+#define Q0 0
+#define Q1 1
+#define Q2 2
+
+static int mlfq_quantum[3] = { 15, 10, 2 };
+static int mlfq_allotment[3] = { 0, 10, 2 };
+static int mlfq_boost_interval = 60;
+static int last_at[3] = { -1, -1, -1 };
+static uint last_boost;
 
 // Linux CFS weights for nice -20 .. 19, indexed by nice + 20
 // (nice 0 has weight 1024). This is the same table user/wl.c uses
@@ -53,6 +77,98 @@ const int nice_weight[40] = {
 
 static int quantum = 10; // ticks a process may run before preemption
 static int last = -1;    // index in proc[] of the last process chosen
+static int last_stride = -1; // index used to rotate stride ties
+
+static int
+is_mlfq_policy(int id)
+{
+    return id == SCHED_MLFQ || id == SCHED_MLFQ_STRIDE ||
+         id == SCHED_MLFQ_BOOST30 || id == SCHED_MLFQ_Q1Q5 ||
+         id == SCHED_MLFQ_Q1A5;
+}
+
+static uint64
+stride_for_nice(int nice)
+{
+  return ((uint64)1 << 24) / nice_weight[nice + 20];
+}
+
+static int
+queue_for_nice(int nice)
+{
+  if (nice <= -10)
+    return Q2;
+  if (nice <= 10)
+    return Q1;
+  return Q0;
+}
+
+static void
+set_level(struct proc *p, int level)
+{
+  int old = p->level;
+
+  if (old == level)
+    return;
+  p->level = level;
+  if (logging)
+    printk("level %d %d->%d at %d\n", p->pid, old, level, ticks);
+}
+
+static void
+mlfq_boost_if_due(void)
+{
+  if ((uint)(ticks - last_boost) < (uint)mlfq_boost_interval)
+    return;
+
+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
+    if (p->state == UNUSED)
+      continue;
+    set_level(p, p->start > Q1 ? p->start : Q1);
+    p->used = 0;
+  }
+  last_boost = ticks;
+}
+
+static struct proc *
+pick_mlfq(void)
+{
+  mlfq_boost_if_due();
+  for (int level = Q2; level >= Q0; level--) {
+    for (int i = 1; i <= NPROC; i++) {
+      struct proc *p = &proc[(last_at[level] + i) % NPROC];
+      if (p->state == RUNNABLE && p->level == level) {
+        last_at[level] = p - proc;
+        return p;
+      }
+    }
+  }
+  return 0;
+}
+
+static struct proc *
+pick_mlfq_stride(void)
+{
+  mlfq_boost_if_due();
+  for (int level = Q2; level >= Q0; level--) {
+    uint64 min_pass = ~(uint64)0;
+    for (struct proc *p = proc; p < &proc[NPROC]; p++)
+      if (p->state == RUNNABLE && p->level == level && p->vrt < min_pass)
+        min_pass = p->vrt;
+
+    if (min_pass == ~(uint64)0)
+      continue;
+
+    for (int i = 1; i <= NPROC; i++) {
+      struct proc *p = &proc[(last_at[level] + i) % NPROC];
+      if (p->state == RUNNABLE && p->level == level && p->vrt == min_pass) {
+        last_at[level] = p - proc;
+        return p;
+      }
+    }
+  }
+  return 0;
+}
 
 // Called by set_scheduler(id), and again when a workload starts.
 // Set up global state for policy id.
@@ -62,16 +178,66 @@ policy_init(int id)
 {
   switch (id) {
   case SCHED_RR:
+  case SCHED_RR1:
+  case SCHED_PRIO:
+  case SCHED_MLFQ:
+  case SCHED_MLFQ_STRIDE:
+  case SCHED_STRIDE:
+  case SCHED_RR5:
+  case SCHED_MLFQ_BOOST30:
+  case SCHED_MLFQ_Q1Q5:
+  case SCHED_MLFQ_Q1A5:
+    break;
+  default:
+    return -1;
+  }
+
+  mlfq_quantum[Q0] = 15;
+  mlfq_quantum[Q1] = 10;
+  mlfq_quantum[Q2] = 2;
+  mlfq_allotment[Q0] = 0;
+  mlfq_allotment[Q1] = 10;
+  mlfq_allotment[Q2] = 2;
+  mlfq_boost_interval = 60;
+
+  switch (id) {
+  case SCHED_RR:
   case SCHED_PRIO:
     quantum = 10;
     break;
   case SCHED_RR1:
     quantum = 1;
     break;
+  case SCHED_RR5:
+    quantum = 5;
+    break;
+  case SCHED_MLFQ:
+  case SCHED_MLFQ_STRIDE:
+  case SCHED_MLFQ_BOOST30:
+  case SCHED_MLFQ_Q1Q5:
+  case SCHED_MLFQ_Q1A5:
+    quantum = 10;
+    break;
+  case SCHED_STRIDE:
+    quantum = 5;
+    break;
   default:
-    return -1;
+    break;
   }
+  if (id == SCHED_MLFQ_BOOST30)
+    mlfq_boost_interval = 30;
+  else if (id == SCHED_MLFQ_Q1Q5)
+    mlfq_quantum[Q1] = 5;
+  else if (id == SCHED_MLFQ_Q1A5)
+    mlfq_allotment[Q1] = 5;
+  else if (id == SCHED_MLFQ_STRIDE)
+    mlfq_allotment[Q1] = 5;
+
   last = -1;
+  last_stride = -1;
+  for (int i = 0; i < 3; i++)
+    last_at[i] = -1;
+  last_boost = ticks;
   return 0;
 }
 
@@ -85,9 +251,11 @@ policy_proc_init(struct proc *p)
   // Level 0 is the lowest queue (Q0); Q2 is the highest. An MLFQ must
   // set the starting level from p->nice here: workload_start() calls
   // this for every process after the jobs' nice values are set.
-  p->level = 0;
+  p->start = queue_for_nice(p->nice);
+  p->level = is_mlfq_policy(sched_current) ? p->start : Q0;
   p->used = 0;
   p->vrt = 0;
+  p->stride = stride_for_nice(p->nice);
 }
 
 // Round robin: the next RUNNABLE process after the last one chosen,
@@ -125,6 +293,28 @@ pick_prio(void)
   return 0;
 }
 
+static struct proc *
+pick_stride(void)
+{
+  uint64 min_pass = ~(uint64)0;
+
+  for (struct proc *p = proc; p < &proc[NPROC]; p++)
+    if (p->state == RUNNABLE && p->vrt < min_pass)
+      min_pass = p->vrt;
+
+  if (min_pass == ~(uint64)0)
+    return 0;
+
+  for (int i = 1; i <= NPROC; i++) {
+    struct proc *p = &proc[(last_stride + i) % NPROC];
+    if (p->state == RUNNABLE && p->vrt == min_pass) {
+      last_stride = p - proc;
+      return p;
+    }
+  }
+  return 0;
+}
+
 // Choose the next process to run, or return 0 if none is RUNNABLE.
 struct proc *
 policy_pick_next_proc(void)
@@ -132,6 +322,17 @@ policy_pick_next_proc(void)
   switch (sched_current) {
   case SCHED_PRIO:
     return pick_prio();
+  case SCHED_MLFQ:
+  case SCHED_MLFQ_BOOST30:
+  case SCHED_MLFQ_Q1Q5:
+  case SCHED_MLFQ_Q1A5:
+    return pick_mlfq();
+  case SCHED_MLFQ_STRIDE:
+    return pick_mlfq_stride();
+  case SCHED_STRIDE:
+    return pick_stride();
+  case SCHED_RR5:
+    return pick_rr();
   default:
     return pick_rr();
   }
@@ -155,6 +356,31 @@ policy_dispatch(struct proc *p)
 int
 policy_tick(struct proc *p)
 {
+  if (sched_current == SCHED_STRIDE) {
+    p->vrt += p->stride;
+    p->qticks++;
+    return p->qticks >= quantum;
+  }
+  if (is_mlfq_policy(sched_current)) {
+    if (sched_current == SCHED_MLFQ_STRIDE)
+      p->vrt += p->stride;
+    p->used++;
+    p->qticks++;
+    mlfq_boost_if_due();
+
+    int quantum_expired = p->qticks >= mlfq_quantum[p->level];
+    if (mlfq_allotment[p->level] > 0 &&
+        p->used >= mlfq_allotment[p->level]) {
+      set_level(p, p->level - 1);
+      p->used = 0;
+    }
+
+    int preempt = quantum_expired;
+    for (struct proc *q = proc; q < &proc[NPROC]; q++)
+      if (q->state == RUNNABLE && q->level > p->level)
+        preempt = 1;
+    return preempt;
+  }
   p->qticks++;
   return p->qticks >= quantum;
 }
@@ -167,10 +393,31 @@ policy_tick(struct proc *p)
 void
 policy_wakeup(struct proc *p)
 {
+  if (sched_current == SCHED_STRIDE || sched_current == SCHED_MLFQ_STRIDE) {
+    uint64 min_pass = ~(uint64)0;
+    for (struct proc *q = proc; q < &proc[NPROC]; q++) {
+      if (q == p || (q->state != RUNNING && q->state != RUNNABLE))
+        continue;
+      if (q->vrt < min_pass)
+        min_pass = q->vrt;
+    }
+    if (min_pass != ~(uint64)0 && p->vrt < min_pass)
+      p->vrt = min_pass;
+  }
 }
 
 // Called whenever p's nice value changes.
 void
 policy_nice(struct proc *p)
 {
+  if (sched_current == SCHED_STRIDE || sched_current == SCHED_MLFQ_STRIDE)
+    p->stride = stride_for_nice(p->nice);
+  if (is_mlfq_policy(sched_current)) {
+    int start = queue_for_nice(p->nice);
+    if (start != p->start) {
+      p->start = start;
+      set_level(p, start);
+      p->used = 0;
+    }
+  }
 }
